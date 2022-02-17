@@ -18,7 +18,7 @@ CURSOR_ITER_SIZE = 20000
 
 # pylint: disable=invalid-name,missing-function-docstring
 def calculate_destination_stream_name(stream, md_map):
-    return f"{md_map.get((), {}).get('schema-name')}-{stream['stream']}"
+    return f"{stream['stream']}"
 
 
 # from the postgres docs:
@@ -209,7 +209,7 @@ def hstore_available(conn_info):
 
 
 def compute_tap_stream_id(schema_name, table_name):
-    return schema_name + '-' + table_name
+    return table_name
 
 
 # NB> numeric/decimal columns in postgres without a specified scale && precision

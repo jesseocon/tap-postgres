@@ -446,3 +446,6 @@ def main():
     except Exception as exc:
         LOGGER.critical(exc)
         raise exc
+        
+if __name__=="__main__":
+    main()
