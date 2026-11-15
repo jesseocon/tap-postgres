@@ -51,7 +51,7 @@ def cluster(tmp_path_factory):
     subprocess.run([bin_dir / 'initdb', '-D', data, '-U', 'postgres', '-A', 'trust', '--no-sync', '-E', 'UTF8'],
                    check=True, capture_output=True)
     subprocess.run([bin_dir / 'pg_ctl', '-D', data, '-l', root / 'log', '-w', 'start',
-                    '-o', f"-p {port} -c listen_addresses=127.0.0.1 -c fsync=off -c max_connections=50"],
+                    '-o', f"-p {port} -k {root} -c listen_addresses=127.0.0.1 -c fsync=off -c max_connections=50"],
                    check=True, capture_output=True)
     admin = {'host': '127.0.0.1', 'port': port, 'user': 'postgres', 'dbname': 'postgres'}
     conn = psycopg2.connect(**admin)
