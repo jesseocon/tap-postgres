@@ -350,9 +350,15 @@ def sync_table(conn_config, stream, state, desired_columns, md_map, deadline=Non
                 state = singer.write_bookmark(state, tap_stream_id, 'xmin_snapshot', None)
                 state = singer.write_bookmark(state, tap_stream_id, 'initial_load', None)
         if singer.get_bookmark(state, tap_stream_id, 'xmin_snapshot') is None:
-            return _initial_load(table, state, reader, conn_config, deadline)
+            state = _initial_load(table, state, reader, conn_config, deadline)
+            # A first load reads every key, so a scan is only due when asked for (key_scan).
+            if not conn_config.get('key_scan'):
+                return state
         if key_scan_due(state, tap_stream_id, conn_config):
-            state = _key_scan(table, state, reader, conn_config, deadline)
+            if deadline is not None and time.monotonic() >= deadline:
+                LOGGER.info('%s: key scan left for the next run (time budget used up)', tap_stream_id)
+            else:
+                state = _key_scan(table, state, reader, conn_config)
         return state
     finally:
         reader.close()
@@ -411,7 +417,9 @@ def _incremental(table, state, reader, conn_config):
     return state
 
 
-def _key_scan(table, state, reader, conn_config, deadline):
+def _key_scan(table, state, reader, conn_config):
+    """Every primary key, as _sdc_key_only records. Never stopped part-way by the time budget:
+    a loader takes the keys it got as the whole table, so a partial scan would mark live rows."""
     tap_stream_id = table.tap_stream_id
     limit = int(conn_config.get('key_scan_chunk_keys') or DEFAULT_KEY_SCAN_CHUNK_KEYS)
     started = _now()
@@ -431,7 +439,6 @@ def _key_scan(table, state, reader, conn_config, deadline):
             total += len(rows)
             if len(rows) < limit:
                 break
-            _check_budget(deadline, f'{tap_stream_id}: key scan')
     LOGGER.info('%s: key scan sent %s keys', tap_stream_id, total)
     return singer.write_bookmark(state, tap_stream_id, 'key_scan_at', started.isoformat())
 

@@ -221,3 +221,15 @@ def test_types_come_through(db):
     assert datetime.fromisoformat(row['ts']) == datetime(2026, 11, 14, 10, tzinfo=timezone.utc)
     db.sql("UPDATE t SET b = false")
     assert db.sync().records('public__t')[0]['b'] is False
+
+
+def test_a_forced_key_scan_follows_a_first_load(db):
+    """full_table use: every run starts without bookmarks and asks for a key scan."""
+    db.sql('CREATE TABLE items (id int PRIMARY KEY)')
+    db.sql('INSERT INTO items SELECT generate_series(1, 5)')
+    result = db.sync(state={}, key_scan=True)
+    assert _ids(result.records('public__items', key_only=False)) == [1, 2, 3, 4, 5]
+    assert _ids(result.records('public__items', key_only=True)) == [1, 2, 3, 4, 5]
+    # the full rows come first, then the keys
+    kinds = [bool(m['record'].get('_sdc_key_only')) for m in result.messages if m['type'] == 'RECORD']
+    assert kinds == [False] * 5 + [True] * 5
