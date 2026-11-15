@@ -113,3 +113,20 @@ config.json
 
 # JetBrains IDEs
 .idea/*
+# Local test artifacts and anything private: never commit
+.DS_Store
+.env
+.env.*
+*.pem
+*.key
+config*.json
+catalog.json
+state*.json
+*.jsonl
+*.csv
+output*
+scripts/
+load_to_bigquery.py
+requirements-bigquery.txt
+.secrets/*
+!.secrets/.gitignore
