@@ -11,6 +11,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import uuid
 from pathlib import Path
 
@@ -47,11 +48,13 @@ def cluster(tmp_path_factory):
         pytest.skip('no Postgres binaries (set PG_BIN)')
     root = tmp_path_factory.mktemp('pg')
     data = root / 'data'
+    # Unix socket paths are short (~100 bytes): a directory of its own under /tmp.
+    sock = tempfile.mkdtemp(prefix='pg', dir='/tmp')
     port = _free_port()
     subprocess.run([bin_dir / 'initdb', '-D', data, '-U', 'postgres', '-A', 'trust', '--no-sync', '-E', 'UTF8'],
                    check=True, capture_output=True)
     subprocess.run([bin_dir / 'pg_ctl', '-D', data, '-l', root / 'log', '-w', 'start',
-                    '-o', f"-p {port} -k {root} -c listen_addresses=127.0.0.1 -c fsync=off -c max_connections=50"],
+                    '-o', f"-p {port} -k {sock} -c listen_addresses=127.0.0.1 -c fsync=off -c max_connections=50"],
                    check=True, capture_output=True)
     admin = {'host': '127.0.0.1', 'port': port, 'user': 'postgres', 'dbname': 'postgres'}
     conn = psycopg2.connect(**admin)
@@ -63,6 +66,7 @@ def cluster(tmp_path_factory):
         yield admin
     finally:
         subprocess.run([bin_dir / 'pg_ctl', '-D', data, '-m', 'immediate', 'stop'], capture_output=True)
+        shutil.rmtree(sock, ignore_errors=True)
 
 
 class Db:
