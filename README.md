@@ -1,3 +1,151 @@
+# tap-postgres (Aria)
+
+Hotglue's fork (gitlab.com/hotglue/tap-postgres) of
+[pipelinewise-tap-postgres](https://github.com/transferwise/pipelinewise-tap-postgres), with the
+additions below. Licensed as upstream: GNU AGPLv3 (see `LICENSE`). It is the tap behind Aria's
+`postgres` connector (`aria-singer-taps`, singer-connector), pinned by tag (`v1.8.3-aria.N`).
+Everything upstream and Hotglue's fork do still works as before; the additions are opt-in config.
+
+## What this fork adds
+
+| Config | Default | What it does |
+|---|---|---|
+| `read_only` | `true` | Every session (but logical replication's) is READ ONLY: `SET SESSION default_transaction_read_only = on`, and every transaction `BEGIN ... READ ONLY`. A login that could write never does. |
+| `default_replication_method: XMIN` (or a stream's `replication-method`) | | Incremental sync without a replication key or a slot: rows whose `xmin` is at or after the last read's snapshot (below). |
+| `chunk_rows` | 10000 | Initial-load chunk: rows per short READ ONLY transaction, by primary key. |
+| `xmin_chunk_keys` | 100000 | Incremental: keys walked per transaction while filtering on xmin. |
+| `key_scan_interval_hours` | 24 | How often each table's primary keys are sent for delete detection (0: never). |
+| `key_scan` | `false` | Send the keys this run, whatever the interval. |
+| `key_scan_chunk_keys` | 100000 | Keys per transaction in a key scan. |
+| `time_budget_seconds` | none | Stop starting new chunks after this long; the state says where to resume, and the next run starts with that table. |
+| `standby_retries` | 4 | A chunk cancelled by a hot standby (SQLSTATE 40001 / 57014) or a dropped connection is retried this often, at half its size, with backoff. |
+| `stream_name_separator` | none | `"__"` names streams `<schema>__<table>` (default, as Hotglue's fork: the table's name alone). |
+| `include_tables` | none (every table) | Only these tables: names or fnmatch patterns on `table` or `schema.table` (list, or comma separated). Tables created later sync automatically when nothing narrows them. |
+| `exclude_tables`, `exclude_schemas` | none | Never these, even if included: excluded tables are not even discovered. |
+| `exclude_partitions` | `false` | Leave partitions out; their rows come through the partitioned parent. |
+| `sslmode` | none | libpq `sslmode` (`require`, `verify-full`, ...); `ssl: "true"` still means `require`. |
+
+### XMIN replication
+
+`tap_postgres/sync_strategies/xmin.py`. Per table, in the stream's bookmarks:
+
+- **Initial load** (no `xmin_snapshot` yet): every row in chunks of `chunk_rows`, ordered by the
+  primary key, each chunk its own REPEATABLE READ, READ ONLY transaction. `initial_load` keeps
+  the first chunk's snapshot xmin and the last key read, so a run cut short resumes there.
+- **Incremental**: rows whose 32-bit `xmin` lies in `[xmin_snapshot, snapshot xmax)` on the
+  32-bit circle (one range, or two across 2^32; ids 0-2 never match). Bookmarks are 64-bit
+  (`pg_snapshot_xmin(pg_current_snapshot())`, `txid_current_snapshot()` before Postgres 13); no
+  call ever assigns a transaction id, so it runs on a hot standby. The new bookmark is the
+  earliest snapshot xmin of the run, so a row can be read twice, never missed.
+- **Re-sync**: a bookmark half the 32-bit circle behind the snapshot (wraparound) or far ahead of
+  it (another cluster, a restore) starts a new initial load. A replica a little behind reads
+  nothing this time.
+- **Deletes**: a deleted row leaves nothing to read. Every `key_scan_interval_hours` the table's
+  primary keys are sent as records holding only the key columns and `_sdc_key_only: true` (in the
+  stream's SCHEMA as a nullable boolean). A loader can mark rows whose keys were not sent as
+  deleted; aria-singer-taps sets `_aria_deleted_at`. Loaders that don't know the column get extra
+  key-only rows, so leave `key_scan_interval_hours: 0` for them.
+- **No primary key** (or a view): read whole each run in one READ ONLY transaction, retried only
+  if it failed before the first row was sent.
+
+## Read-only role
+
+The connector reads with one login, `aria_sync`, that can only `SELECT`. Run either version on the
+**primary**, as the role that owns the tables (on Neon, the default owner role, usually
+`neondb_owner`), then give the connector the **read replica's** host, with `aria_sync` and its password
+(direct, not pooled, `sslmode=require`).
+
+### Simple version
+
+Enough when all tables are in `public` and the role running it is the one that creates tables
+(e.g. runs the migrations). Replace the password and the database name.
+
+```sql
+CREATE ROLE aria_sync LOGIN PASSWORD '<long random password>';
+GRANT CONNECT ON DATABASE neondb TO aria_sync;
+GRANT USAGE ON SCHEMA public TO aria_sync;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO aria_sync;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO aria_sync;
+```
+
+`ALTER DEFAULT PRIVILEGES` covers tables created later **by the role that ran it**. If another role
+creates tables, run `ALTER DEFAULT PRIVILEGES FOR ROLE <that_role> IN SCHEMA public GRANT SELECT ON
+TABLES TO aria_sync;` too.
+
+### Complete version
+
+One block for any database. Safe to re-run.
+
+- Covers every non-system schema, not only `public`.
+- Covers tables created later by every role that owns tables in each schema, plus the role running it.
+- Creates the role once; each run sets a fresh generated password and re-applies the grants.
+- Locks the role down: no superuser, no creating databases or roles, no replication.
+- Ends with a small result: the password (shown once), `tables readable by aria_sync: N of N`, and a
+  `WARNING` row naming the role to re-run as if a future-tables grant could not be set.
+
+```sql
+-- Read-only login for Aria's connector. Safe to re-run.
+CREATE TEMP TABLE IF NOT EXISTS aria_sync_setup (item text, value text);
+TRUNCATE aria_sync_setup;
+
+DO $$
+DECLARE
+  pw     text := replace(gen_random_uuid()::text || gen_random_uuid()::text, '-', '');
+  s      record;
+  o      record;
+BEGIN
+  -- 1. The role: login only, nothing else. Created once; password set fresh each run.
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'aria_sync') THEN
+    CREATE ROLE aria_sync LOGIN;
+  END IF;
+  EXECUTE format('ALTER ROLE aria_sync LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION PASSWORD %L', pw);
+  EXECUTE format('GRANT CONNECT ON DATABASE %I TO aria_sync', current_database());
+
+  -- 2. Every non-system schema: read its tables and views now…
+  FOR s IN SELECT oid, nspname FROM pg_namespace
+           WHERE nspname NOT LIKE 'pg\_%' AND nspname <> 'information_schema' LOOP
+    EXECUTE format('GRANT USAGE ON SCHEMA %I TO aria_sync', s.nspname);
+    EXECUTE format('GRANT SELECT ON ALL TABLES IN SCHEMA %I TO aria_sync', s.nspname);
+
+    -- …and tables created later, by whoever creates them: this role and every role that owns tables there.
+    FOR o IN SELECT DISTINCT r FROM (
+               SELECT current_user::text AS r
+               UNION SELECT pg_get_userbyid(c.relowner) FROM pg_class c
+               WHERE c.relnamespace = s.oid AND c.relkind IN ('r','p','v','m','f')) x LOOP
+      BEGIN
+        EXECUTE format('ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA %I GRANT SELECT ON TABLES TO aria_sync', o.r, s.nspname);
+      EXCEPTION WHEN insufficient_privilege THEN
+        INSERT INTO aria_sync_setup VALUES ('WARNING', format('could not cover future tables created by %s in %s: run this as %s', o.r, s.nspname, o.r));
+      END;
+    END LOOP;
+  END LOOP;
+
+  INSERT INTO aria_sync_setup VALUES ('password (save it now; shown once)', pw);
+END $$;
+
+-- 3. Proof: what aria_sync can read, against everything there is.
+INSERT INTO aria_sync_setup
+SELECT 'tables readable by aria_sync',
+       count(*) FILTER (WHERE has_table_privilege('aria_sync', format('%I.%I', schemaname, tablename), 'SELECT'))
+       || ' of ' || count(*)
+FROM pg_tables WHERE schemaname NOT LIKE 'pg\_%' AND schemaname <> 'information_schema';
+
+SELECT * FROM aria_sync_setup;
+```
+
+### Check the future-tables grants
+
+```sql
+SELECT pg_get_userbyid(defaclrole) AS for_tables_created_by,
+       defaclnamespace::regnamespace AS in_schema,
+       defaclacl
+FROM pg_default_acl;
+```
+
+Each table owner should have a row whose ACL includes `aria_sync=r`.
+
+---
+
 # pipelinewise-tap-postgres
 
 [![PyPI version](https://badge.fury.io/py/pipelinewise-tap-postgres.svg)](https://badge.fury.io/py/pipelinewise-tap-postgres)

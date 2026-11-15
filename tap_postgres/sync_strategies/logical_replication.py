@@ -389,7 +389,8 @@ def consume_message(streams, state, msg, time_extracted, conn_info):
 
     streams_lookup = {s['tap_stream_id']: s for s in streams}
 
-    tap_stream_id = post_db.compute_tap_stream_id(payload['schema'], payload['table'])
+    tap_stream_id = post_db.compute_tap_stream_id(payload['schema'], payload['table'],
+                                                   conn_info.get('stream_name_separator'))
     if streams_lookup.get(tap_stream_id) is None:
         return state
 

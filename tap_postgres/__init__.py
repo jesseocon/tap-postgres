@@ -1,6 +1,7 @@
 import argparse
 import itertools
 import copy
+import time
 import psycopg2
 import psycopg2.extras
 import psycopg2.extensions
@@ -16,6 +17,7 @@ import tap_postgres.sync_strategies.common as sync_common
 from tap_postgres.sync_strategies import logical_replication
 from tap_postgres.sync_strategies import full_table
 from tap_postgres.sync_strategies import incremental
+from tap_postgres.sync_strategies import xmin
 from tap_postgres.discovery_utils import discover_db
 from tap_postgres.stream_utils import (
     dump_catalog, clear_state_on_replication_change,
@@ -42,7 +44,7 @@ def do_discovery(conn_config):
     """
     with post_db.open_connection(conn_config) as conn:
         LOGGER.info("Discovering db %s", conn_config['dbname'])
-        streams = discover_db(conn, conn_config.get('filter_schemas'))
+        streams = discover_db(conn, conn_config.get('filter_schemas'), conn_config=conn_config)
 
     if len(streams) == 0:
         raise RuntimeError('0 tables were discovered across the entire cluster')
@@ -103,7 +105,7 @@ def sync_method_for_streams(streams, state, default_replication_method):
 
         state = clear_state_on_replication_change(state, stream['tap_stream_id'], replication_key, replication_method)
 
-        if replication_method not in {'LOG_BASED', 'FULL_TABLE', 'INCREMENTAL'}:
+        if replication_method not in {'LOG_BASED', 'FULL_TABLE', 'INCREMENTAL', 'XMIN'}:
             raise Exception(f"Unrecognized replication_method {replication_method}")
 
         md_map = metadata.to_map(stream['metadata'])
@@ -124,6 +126,9 @@ def sync_method_for_streams(streams, state, default_replication_method):
             traditional_steams.append(stream)
         elif replication_method == 'INCREMENTAL':
             lookup[stream['tap_stream_id']] = 'incremental'
+            traditional_steams.append(stream)
+        elif replication_method == 'XMIN':
+            lookup[stream['tap_stream_id']] = 'xmin'
             traditional_steams.append(stream)
 
         elif get_bookmark(state, stream['tap_stream_id'], 'xmin') and \
@@ -151,7 +156,7 @@ def sync_method_for_streams(streams, state, default_replication_method):
     return lookup, traditional_steams, logical_streams
 
 
-def sync_traditional_stream(conn_config, stream, state, sync_method, end_lsn):
+def sync_traditional_stream(conn_config, stream, state, sync_method, end_lsn, deadline=None):
     """
     Sync INCREMENTAL and FULL_TABLE streams
     """
@@ -173,6 +178,11 @@ def sync_traditional_stream(conn_config, stream, state, sync_method, end_lsn):
     elif sync_method == 'incremental':
         state = singer.set_currently_syncing(state, stream['tap_stream_id'])
         state = do_sync_incremental(conn_config, stream, state, desired_columns, md_map)
+    elif sync_method == 'xmin':
+        state = singer.set_currently_syncing(state, stream['tap_stream_id'])
+        LOGGER.info("Stream %s is using xmin replication", stream['tap_stream_id'])
+        # TimeBudgetExhausted propagates with currently_syncing still set: the next run resumes here.
+        state = xmin.sync_table(conn_config, stream, state, desired_columns, md_map, deadline)
     elif sync_method == 'logical_initial':
         state = singer.set_currently_syncing(state, stream['tap_stream_id'])
         LOGGER.info("Performing initial full table sync")
@@ -308,12 +318,24 @@ def do_sync(conn_config, catalog, default_replication_method, state, state_file=
     else:
         LOGGER.info("No streams marked as currently_syncing in state file")
 
+    budget = conn_config.get('time_budget_seconds')
+    deadline = time.monotonic() + float(budget) if budget else None
     for stream in traditional_streams:
-        state = sync_traditional_stream(conn_config,
-                                        stream,
-                                        state,
-                                        sync_method_lookup[stream['tap_stream_id']],
-                                        end_lsn)
+        try:
+            state = sync_traditional_stream(conn_config,
+                                            stream,
+                                            state,
+                                            sync_method_lookup[stream['tap_stream_id']],
+                                            end_lsn,
+                                            deadline)
+        except xmin.TimeBudgetExhausted as exc:
+            LOGGER.warning("Time budget of %ss used up during %s; stopping here, the next run resumes",
+                           budget, exc)
+            singer.write_message(singer.StateMessage(value=copy.deepcopy(state)))
+            return state
+        if deadline is not None and time.monotonic() >= deadline:
+            LOGGER.warning("Time budget of %ss used up; the remaining streams sync next run", budget)
+            return state
 
     logical_streams.sort(key=lambda s: metadata.to_map(s['metadata']).get(()).get('database-name'))
     for dbname, streams in itertools.groupby(logical_streams,
@@ -407,6 +429,27 @@ def main_impl():
         'break_at_end_lsn': args.config.get('break_at_end_lsn', True),
         'logical_poll_total_seconds': float(args.config.get('logical_poll_total_seconds', 0)),
         'use_secondary': args.config.get('use_secondary', False),
+
+        # Every non-replication session is READ ONLY (db.make_read_only); false turns it off.
+        'read_only': args.config.get('read_only', True) not in (False, 'false'),
+        # "__": streams are named <schema>__<table> (default: the table's name alone).
+        'stream_name_separator': args.config.get('stream_name_separator'),
+        # Which tables are discovered: fnmatch patterns on `table` or `schema.table`.
+        'include_tables': args.config.get('include_tables'),
+        'exclude_tables': args.config.get('exclude_tables'),
+        'exclude_schemas': args.config.get('exclude_schemas'),
+        # Partitions are left out; their rows come through the partitioned parent.
+        'exclude_partitions': args.config.get('exclude_partitions') in (True, 'true'),
+
+        # XMIN replication (sync_strategies/xmin.py)
+        'chunk_rows': args.config.get('chunk_rows'),
+        'xmin_chunk_keys': args.config.get('xmin_chunk_keys'),
+        'key_scan_chunk_keys': args.config.get('key_scan_chunk_keys'),
+        'key_scan_interval_hours': args.config.get('key_scan_interval_hours'),
+        'key_scan': args.config.get('key_scan') in (True, 'true'),
+        'standby_retries': args.config.get('standby_retries', xmin.DEFAULT_RETRIES),
+        # Stop starting new chunks after this long; the state says where to resume.
+        'time_budget_seconds': args.config.get('time_budget_seconds'),
     }
 
     if conn_config['use_secondary']:
@@ -423,6 +466,8 @@ def main_impl():
 
     if args.config.get('ssl') == 'true':
         conn_config['sslmode'] = 'require'
+    if args.config.get('sslmode'):
+        conn_config['sslmode'] = args.config['sslmode']
 
     post_db.CURSOR_ITER_SIZE = int(args.config.get('itersize', post_db.CURSOR_ITER_SIZE))
 

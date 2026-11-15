@@ -63,7 +63,22 @@ def open_connection(conn_config, logical_replication=False, prioritize_primary=F
 
     conn = psycopg2.connect(**cfg)
 
+    if conn_config.get('read_only', True) and not logical_replication:
+        make_read_only(conn)
+
     return conn
+
+
+def make_read_only(conn):
+    """Every transaction on this connection is READ ONLY, twice over: the session default
+    (default_transaction_read_only) and psycopg2's own BEGIN ... READ ONLY. A login that could
+    write still never does. Set with SET rather than a startup option so it also works through
+    poolers that refuse startup options."""
+    conn.autocommit = True
+    with conn.cursor() as cur:
+        cur.execute("SET SESSION default_transaction_read_only = on")
+    conn.autocommit = False
+    conn.set_session(readonly=True)
 
 def prepare_columns_for_select_sql(c, md_map):
     column_name = f' "{canonicalize_identifier(c)}" '
@@ -208,7 +223,11 @@ def hstore_available(conn_info):
             return False
 
 
-def compute_tap_stream_id(schema_name, table_name):
+def compute_tap_stream_id(schema_name, table_name, separator=None):
+    """The stream's name: the table's, or `<schema><separator><table>` when the config sets
+    stream_name_separator (e.g. "__"), so tables of the same name in two schemas stay apart."""
+    if separator:
+        return f'{schema_name}{separator}{table_name}'
     return table_name
 
 
