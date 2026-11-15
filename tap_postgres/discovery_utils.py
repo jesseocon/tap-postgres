@@ -1,5 +1,6 @@
 import collections
 import copy
+import fnmatch
 
 from typing import List, Optional
 import psycopg2.extras
@@ -40,16 +41,60 @@ BASE_RECURSIVE_SCHEMAS = {
 }
 
 
-def discover_db(connection, filter_schemas=None, tables: Optional[List[str]] = None):
+def discover_db(connection, filter_schemas=None, tables: Optional[List[str]] = None, conn_config=None):
     """
     Discover streams in the DB cluster
+
+    conn_config (optional) narrows and names the streams: include_tables / exclude_schemas /
+    exclude_tables (see table_wanted) and stream_name_separator (see compute_tap_stream_id).
     """
-    table_info = produce_table_info(connection, filter_schemas, tables)
-    db_streams = discover_columns(connection, table_info)
+    conn_config = conn_config or {}
+    table_info = produce_table_info(connection, filter_schemas, tables,
+                                    exclude_partitions=bool(conn_config.get('exclude_partitions')))
+    table_info = filter_table_info(table_info, conn_config)
+    db_streams = discover_columns(connection, table_info, conn_config.get('stream_name_separator'))
     return db_streams
 
 
-def produce_table_info(conn, filter_schemas=None, tables: Optional[List[str]] = None):
+def _patterns(value) -> List[str]:
+    """A list, or a comma separated string, of names or fnmatch patterns."""
+    if not value:
+        return []
+    if isinstance(value, str):
+        value = value.split(',')
+    return [str(v).strip() for v in value if str(v).strip()]
+
+
+def table_wanted(schema_name: str, table_name: str, conn_config) -> bool:
+    """Whether a table is discovered (and so synced).
+
+    include_tables: only these (`table` or `schema.table`, fnmatch patterns); none: every table
+    of the filter_schemas, new ones too. exclude_schemas / exclude_tables: never these, even when
+    included. Exclusion wins, so a table excluded for holding secrets can't come back by a
+    pattern.
+    """
+    names = (table_name, f'{schema_name}.{table_name}')
+
+    def matches(patterns):
+        return any(fnmatch.fnmatchcase(name, pattern) for pattern in patterns for name in names)
+
+    if any(fnmatch.fnmatchcase(schema_name, p) for p in _patterns(conn_config.get('exclude_schemas'))):
+        return False
+    if matches(_patterns(conn_config.get('exclude_tables'))):
+        return False
+    include = _patterns(conn_config.get('include_tables'))
+    return not include or matches(include)
+
+
+def filter_table_info(table_info, conn_config):
+    """table_info without the tables table_wanted() leaves out."""
+    return {
+        schema_name: {name: info for name, info in tables.items() if table_wanted(schema_name, name, conn_config)}
+        for schema_name, tables in table_info.items()
+    }
+
+
+def produce_table_info(conn, filter_schemas=None, tables: Optional[List[str]] = None, exclude_partitions=False):
     """
     Generates info about tables in the cluster
     """
@@ -107,6 +152,10 @@ AND pg_class.relkind IN ('r', 'v', 'm', 'p')
 AND n.nspname NOT in ('pg_toast', 'pg_catalog', 'information_schema')
 AND has_column_privilege(pg_class.oid, attname, 'SELECT') = true """
 
+        if exclude_partitions:
+            # A partitioned table's rows are read through the parent (relkind 'p') once.
+            sql += " AND NOT pg_class.relispartition "
+
         if filter_schemas:
             sql = post_db.filter_schemas_sql_clause(sql, filter_schemas)
 
@@ -131,7 +180,7 @@ AND has_column_privilege(pg_class.oid, attname, 'SELECT') = true """
         return table_info
 
 
-def discover_columns(connection, table_info):
+def discover_columns(connection, table_info, stream_name_separator=None):
     """
     Generates more info about columns of the given table
     """
@@ -173,10 +222,11 @@ def discover_columns(connection, table_info):
                     mdata = metadata.write(mdata, ('properties', c_name), 'inclusion', 'available')
                     mdata = metadata.write(mdata, ('properties', c_name), 'selected-by-default', True)
 
+            stream_name = post_db.compute_tap_stream_id(schema_name, table_name, stream_name_separator)
             entry = {'table_name': table_name,
-                     'stream': table_name,
+                     'stream': stream_name,
                      'metadata': metadata.to_list(mdata),
-                     'tap_stream_id': post_db.compute_tap_stream_id(schema_name, table_name),
+                     'tap_stream_id': stream_name,
                      'schema': schema}
 
             entries.append(entry)

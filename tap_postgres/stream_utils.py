@@ -69,7 +69,8 @@ def refresh_streams_schema(conn_config: Dict, streams: List[Dict]):
     with open_connection(conn_config) as conn:
         new_discovery = {
             stream['tap_stream_id']: stream
-            for stream in discover_db(conn, conn_config.get('filter_schemas'), [st['table_name'] for st in streams])
+            for stream in discover_db(conn, conn_config.get('filter_schemas'), [st['table_name'] for st in streams],
+                                  conn_config)
         }
 
         LOGGER.debug('New discovery schemas %s', new_discovery)
