@@ -429,6 +429,11 @@ def main_impl():
         'break_at_end_lsn': args.config.get('break_at_end_lsn', True),
         'logical_poll_total_seconds': float(args.config.get('logical_poll_total_seconds', 0)),
         'use_secondary': args.config.get('use_secondary', False),
+        # Logical replication: 'wal2json' (default) or 'pgoutput' (built in; needs a publication);
+        # replication_slot names the slot to read (default: pipelinewise_<dbname>[_<tap_id>]).
+        'logical_plugin': args.config.get('logical_plugin'),
+        'replication_slot': args.config.get('replication_slot'),
+        'publication_names': args.config.get('publication_names'),
 
         # Every non-replication session is READ ONLY (db.make_read_only); false turns it off.
         'read_only': args.config.get('read_only', True) not in (False, 'false'),

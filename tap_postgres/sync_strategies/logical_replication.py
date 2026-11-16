@@ -16,6 +16,7 @@ from functools import reduce
 
 import tap_postgres.db as post_db
 import tap_postgres.sync_strategies.common as sync_common
+from tap_postgres.sync_strategies import pgoutput
 from tap_postgres.stream_utils import refresh_streams_schema
 
 LOGGER = singer.get_logger('tap_postgres')
@@ -385,8 +386,11 @@ def consume_message(streams, state, msg, time_extracted, conn_info):
     except Exception:
         return state
 
-    lsn = msg.data_start
+    return consume_payload(streams, state, payload, msg.data_start, time_extracted, conn_info)
 
+
+def consume_payload(streams, state, payload, lsn, time_extracted, conn_info):
+    """One change (wal2json's JSON, or pgoutput's decoded the same way) -> a RECORD and the lsn bookmark."""
     streams_lookup = {s['tap_stream_id']: s for s in streams}
 
     tap_stream_id = post_db.compute_tap_stream_id(payload['schema'], payload['table'],
@@ -520,6 +524,14 @@ def locate_replication_slot_by_cur(cursor, dbname, tap_id=None):
 def locate_replication_slot(conn_info):
     with post_db.open_connection(conn_info, False, True) as conn:
         with conn.cursor() as cur:
+            named = conn_info.get('replication_slot')
+            if named:
+                # A slot the customer made (pgoutput): use it by name.
+                cur.execute("SELECT 1 FROM pg_replication_slots WHERE slot_name = %s", (named,))
+                if not cur.fetchall():
+                    raise ReplicationSlotNotFoundError(f'Unable to find replication slot {named}')
+                LOGGER.info('Using pg_replication_slot %s', named)
+                return named
             return locate_replication_slot_by_cur(cur, conn_info['dbname'], conn_info['tap_id'])
 
 
@@ -574,6 +586,11 @@ def sync_tables(conn_info, logical_streams, state, end_lsn, state_file):
     for s in logical_streams:
         sync_common.send_schema_message(s, ['lsn'])
 
+    plugin = (conn_info.get('logical_plugin') or 'wal2json').lower()
+    if plugin == 'pgoutput' and not conn_info.get('publication_names'):
+        raise Exception('pgoutput needs publication_names')
+    decoder = pgoutput.Decoder() if plugin == 'pgoutput' else None
+
     version = get_pg_version(conn_info)
 
     # Create replication connection and cursor
@@ -592,14 +609,22 @@ def sync_tables(conn_info, logical_streams, state, end_lsn, state_file):
                     int_to_lsn(end_lsn),
                     slot)
         # psycopg2 2.8.4 will send a keep-alive message to postgres every status_interval
-        cur.start_replication(slot_name=slot,
-                              decode=True,
-                              start_lsn=start_lsn,
-                              status_interval=poll_interval,
-                              options={
-                                  'write-in-chunks': 1,
-                                  'add-tables': streams_to_wal2json_tables(logical_streams)
-                              })
+        if decoder is not None:
+            # pgoutput: binary messages for the publication's tables, decoded below.
+            cur.start_replication(slot_name=slot,
+                                  decode=False,
+                                  start_lsn=start_lsn,
+                                  status_interval=poll_interval,
+                                  options={'proto_version': '1', 'publication_names': conn_info['publication_names']})
+        else:
+            cur.start_replication(slot_name=slot,
+                                  decode=True,
+                                  start_lsn=start_lsn,
+                                  status_interval=poll_interval,
+                                  options={
+                                      'write-in-chunks': 1,
+                                      'add-tables': streams_to_wal2json_tables(logical_streams)
+                                  })
 
     except psycopg2.ProgrammingError as ex:
         raise Exception(f"Unable to start replication with logical replication (slot {ex})") from ex
@@ -633,7 +658,12 @@ def sync_tables(conn_info, logical_streams, state, end_lsn, state_file):
                                 int_to_lsn(end_lsn))
                     break
 
-                state = consume_message(logical_streams, state, msg, time_extracted, conn_info)
+                if decoder is not None:
+                    payload = decoder.feed(msg.payload)
+                    if payload is not None:
+                        state = consume_payload(logical_streams, state, payload, msg.data_start, time_extracted, conn_info)
+                else:
+                    state = consume_message(logical_streams, state, msg, time_extracted, conn_info)
 
                 # When using wal2json with write-in-chunks, multiple messages can have the same lsn
                 # This is to ensure we only flush to lsn that has completed entirely
