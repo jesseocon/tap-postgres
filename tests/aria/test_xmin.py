@@ -233,3 +233,20 @@ def test_a_forced_key_scan_follows_a_first_load(db):
     # the full rows come first, then the keys
     kinds = [bool(m['record'].get('_sdc_key_only')) for m in result.messages if m['type'] == 'RECORD']
     assert kinds == [False] * 5 + [True] * 5
+
+
+def test_text_out_extension_types_sync_as_strings(db, capfd):
+    """ltree, xml, tsvector and tsquery come back from psycopg2 as text: synced, not dropped."""
+    db.sql('CREATE EXTENSION IF NOT EXISTS ltree')
+    db.sql('CREATE TABLE docs (id int PRIMARY KEY, path ltree, x xml, v tsvector, q tsquery, p point)')
+    db.sql("""INSERT INTO docs VALUES (1, 'top.science.astronomy', '<a>b</a>', 'fat cat', 'fat & cat', point(1, 2))""")
+    catalog = db.discover()
+    props = next(s for s in catalog['streams'] if s['tap_stream_id'] == 'public__docs')['schema']['properties']
+    for column in ('path', 'x', 'v', 'q'):
+        assert props[column]['type'] == ['null', 'string'], (column, props[column])
+    result = db.sync()
+    row = result.records('public__docs')[0]
+    assert row['path'] == 'top.science.astronomy' and row['x'] == '<a>b</a>'
+    assert row['v'] == "'cat' 'fat'" and row['q'] == "'fat' & 'cat'"
+    assert 'p' not in row  # still unsupported, and said so at discovery
+    assert 'public.docs.p: type point is not supported' in result.stderr

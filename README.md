@@ -25,6 +25,10 @@ Everything upstream and Hotglue's fork do still works as before; the additions a
 | `exclude_partitions` | `false` | Leave partitions out; their rows come through the partitioned parent. |
 | `sslmode` | none | libpq `sslmode` (`require`, `verify-full`, ...); `ssl: "true"` still means `require`. |
 
+Columns of types psycopg2 returns as text (`ltree`, `lquery`, `ltxtquery`, `xml`, `tsvector`, `tsquery`, `name`) sync as strings. Other
+types the tap can't map (`point`, `interval`, `bytea`, ranges, ...) are left out, and discovery logs each one:
+`<schema>.<table>.<column>: type <type> is not supported; the column is not synced`.
+
 ### XMIN replication
 
 `tap_postgres/sync_strategies/xmin.py`. Per table, in the stream's bookmarks:

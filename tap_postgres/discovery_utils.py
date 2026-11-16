@@ -4,9 +4,12 @@ import fnmatch
 
 from typing import List, Optional
 import psycopg2.extras
+import singer
 from singer import metadata
 
 import tap_postgres.db as post_db
+
+LOGGER = singer.get_logger("tap_postgres")
 
 # LogMiner do not support LONG, LONG RAW, CLOB, BLOB, NCLOB, ADT, or COLLECTION datatypes.
 Column = collections.namedtuple('Column', [
@@ -24,6 +27,9 @@ Column = collections.namedtuple('Column', [
 INTEGER_TYPES = {'integer', 'smallint', 'bigint'}
 FLOAT_TYPES = {'real', 'double precision'}
 JSON_TYPES = {'json', 'jsonb'}
+# Types psycopg2 returns as plain text (extensions and full-text search): synced as strings
+# rather than dropped as unsupported.
+TEXT_OUT_TYPES = {'ltree', 'lquery', 'ltxtquery', 'xml', 'tsvector', 'tsquery', 'name'}
 BASE_RECURSIVE_SCHEMAS = {
     'sdc_recursive_integer_array': {'type': ['null', 'integer', 'array'],
                                     'items': {'$ref': '#/definitions/sdc_recursive_integer_array'}},
@@ -213,6 +219,8 @@ def discover_columns(connection, table_info, stream_name_separator=None):
                 mdata = write_sql_data_type_md(mdata, columns[c_name])
 
                 if column_schemas[c_name].get('type') is None:
+                    LOGGER.warning('%s.%s.%s: type %s is not supported; the column is not synced',
+                                   schema_name, table_name, c_name, columns[c_name].sql_data_type)
                     mdata = metadata.write(mdata, ('properties', c_name), 'inclusion', 'unsupported')
                     mdata = metadata.write(mdata, ('properties', c_name), 'selected-by-default', False)
                 elif table_info[schema_name][table_name]['columns'][c_name].is_primary_key:
@@ -326,7 +334,7 @@ def schema_for_column_datatype(col):
             schema['maxLength'] = col.character_maximum_length
         return schema
 
-    if data_type in {'cidr', 'inet', 'macaddr'}:
+    if data_type in {'cidr', 'inet', 'macaddr'} or data_type in TEXT_OUT_TYPES:
         schema['type'] = nullable_column('string', col.is_primary_key)
         return schema
 
