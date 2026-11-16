@@ -98,6 +98,8 @@ def test_pgoutput_sync_copies_then_streams_inserts_updates_and_deletes(db, logic
     assert by_id[3][-1]['note'] == 'third' and by_id[3][-1]['paid'] is True and by_id[3][-1]['_sdc_deleted_at'] is None
     assert by_id[1][-1]['paid'] is False and float(by_id[1][-1]['total']) == 11
     assert by_id[2][-1]['_sdc_deleted_at'] is not None
+    lsns = [r['_sdc_change_lsn'] for r in changes]
+    assert all(isinstance(x, int) for x in lsns) and lsns == sorted(lsns)
 
     # Nothing new: at most the last change again (the slot is confirmed up to the previous run's
     # committed position, so the boundary change can be re-sent; the MERGE makes it harmless).

@@ -108,8 +108,11 @@ def fetch_current_lsn(conn_config):
             return lsn_to_int(current_lsn)
 
 
-def add_automatic_properties(stream, debug_lsn: bool = False):
+def add_automatic_properties(stream, debug_lsn: bool = False, change_lsn: bool = False):
     stream['schema']['properties']['_sdc_deleted_at'] = {'type': ['null', 'string'], 'format': 'date-time'}
+    if change_lsn:
+        # pgoutput: each change's WAL position, so a loader can keep the last change per key.
+        stream['schema']['properties']['_sdc_change_lsn'] = {'type': ['null', 'integer']}
 
     if debug_lsn:
         LOGGER.debug('debug_lsn is ON')
@@ -358,6 +361,7 @@ def row_to_singer_message(stream, row, version, columns, time_extracted, md_map,
     row_to_persist = ()
     md_map[('properties', '_sdc_deleted_at')] = {'sql-datatype': 'timestamp with time zone'}
     md_map[('properties', '_sdc_lsn')] = {'sql-datatype': "character varying"}
+    md_map[('properties', '_sdc_change_lsn')] = {'sql-datatype': 'bigint'}
 
     for idx, elem in enumerate(row):
         sql_datatype = md_map.get(('properties', columns[idx])).get('sql-datatype')
@@ -389,6 +393,10 @@ def consume_message(streams, state, msg, time_extracted, conn_info):
     return consume_payload(streams, state, payload, msg.data_start, time_extracted, conn_info)
 
 
+def _change_lsn(conn_info):
+    return (conn_info.get('logical_plugin') or '').lower() == 'pgoutput'
+
+
 def consume_payload(streams, state, payload, lsn, time_extracted, conn_info):
     """One change (wal2json's JSON, or pgoutput's decoded the same way) -> a RECORD and the lsn bookmark."""
     streams_lookup = {s['tap_stream_id']: s for s in streams}
@@ -417,7 +425,7 @@ def consume_payload(streams, state, payload, lsn, time_extracted, conn_info):
         refresh_streams_schema(conn_info, [target_stream])
 
         # add the automatic properties back to the stream
-        add_automatic_properties(target_stream, conn_info.get('debug_lsn', False))
+        add_automatic_properties(target_stream, conn_info.get('debug_lsn', False), _change_lsn(conn_info))
 
         # publish new schema
         sync_common.send_schema_message(target_stream, ['lsn'])
@@ -444,6 +452,10 @@ def consume_payload(streams, state, payload, lsn, time_extracted, conn_info):
             col_names.append('_sdc_lsn')
             col_vals.append(str(lsn))
 
+        if _change_lsn(conn_info):
+            col_names.append('_sdc_change_lsn')
+            col_vals.append(int(lsn))
+
         record_message = row_to_singer_message(target_stream,
                                                col_vals,
                                                stream_version,
@@ -466,6 +478,10 @@ def consume_payload(streams, state, payload, lsn, time_extracted, conn_info):
         if conn_info.get('debug_lsn'):
             col_names.append('_sdc_lsn')
             col_vals.append(str(lsn))
+
+        if _change_lsn(conn_info):
+            col_names.append('_sdc_change_lsn')
+            col_vals.append(int(lsn))
 
         record_message = row_to_singer_message(target_stream,
                                                col_vals,

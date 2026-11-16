@@ -213,7 +213,8 @@ def sync_logical_streams(conn_config, logical_streams, state, end_lsn, state_fil
                     [s['tap_stream_id'] for s in logical_streams])
 
         logical_streams = [logical_replication.add_automatic_properties(
-            s, conn_config.get('debug_lsn', False)) for s in logical_streams]
+            s, conn_config.get('debug_lsn', False),
+            (conn_config.get('logical_plugin') or '').lower() == 'pgoutput') for s in logical_streams]
 
         # Remove LOG_BASED stream bookmarks from state if it has been de-selected
         # This is to avoid sending very old starting and flushing positions to source
